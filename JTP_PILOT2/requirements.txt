@@ -1,0 +1,8 @@
+gradio==3.48.0
+spaces
+torchvision
+timm==1.0.9
+pillow==9.5.0
+safetensors==0.4.2
+rarfile
+Numpy
