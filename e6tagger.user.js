@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         e621 Autotagger
 // @namespace    https://MeusArtis.ca
-// @version      1.3.1
+// @version      1.4.1
 // @author       Meus Artis
 // @description  Adds a button that automatically tags e621 images and videos
 // @icon         https://www.google.com/s2/favicons?domain=e621.net
@@ -21,10 +21,10 @@
             url: url,
             headers: { "Content-Type": "application/json" },
             data: JSON.stringify({ data: [base64String, confidence], fn_index: 0 }),
-            responseType: "json",
+            responseType: "text", //json
             onload: function(response) {
                 if (response.status === 200 && response.response) {
-                    textarea.value = response.response.data[0];
+                    textarea.value = response.response; //.data[0];
                     done();
                 } else if (fallback) {
                     sendRequest(fallback, base64String, confidence, textarea, null, done);
@@ -52,8 +52,8 @@
         });
     }
     function processImage(button, textarea, throbber) {
-        const confidence = 0.25;
-        const localjtp = "http://127.0.0.1:7860/run/predict";
+        const confidence = 0.33;
+        const localjtp = "http://127.0.0.1:22870/run/predict";
         const media = document.querySelector(".upload_preview_img");
         button.disabled = true;
         button.style.opacity = "0.5";
@@ -84,7 +84,7 @@
         const button = document.createElement("button");
         button.textContent = "Tag Automatically";
         button.classList.add("toggle-button");
-        button.title = "Powered By JTP Pilot², Hosted By Meus Artis";
+        button.title = "Powered By JTP³ Hydra, Hosted By Meus Artis";
         const warningText = document.createElement("span");
         warningText.textContent = "⚠️Manually review tags, or increase confidence setting in userscript.";
         warningText.style.color = "yellow";

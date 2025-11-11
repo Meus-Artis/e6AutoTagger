@@ -308,4 +308,4 @@ with gr.Blocks(css=".output-class { display: none; }") as ui:
             )
 
 if __name__ == "__main__":
-    ui.launch(server_name="127.0.0.1")
+    ui.launch(server_name="127.0.0.1",server_port=22870)
