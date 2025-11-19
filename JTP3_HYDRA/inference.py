@@ -203,11 +203,15 @@ def _run_service(
         import mimetypes
         import logging
         logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
     except ImportError:
         print("Error: Flask is required for --service mode. Install it with: pip install flask", file=sys.stderr)
         sys.exit(1)
 
     app = Flask(__name__)
+    request_count = 0
+    import time
+    start_time = time.time()
     def parse_data_uri(data_uri: str) -> tuple[str, str]:
         """Parse data URI and return (mime_type, base64_data)"""
         if not data_uri.startswith('data:'):
@@ -222,6 +226,14 @@ def _run_service(
 
     @app.route('/run/predict', methods=['POST'])
     def classify_image():
+        nonlocal request_count
+        request_count += 1
+        elapsed = int(time.time() - start_time)
+        days = elapsed // 86400
+        hours = (elapsed % 86400) // 3600
+        minutes = (elapsed % 3600) // 60
+        seconds = elapsed % 60
+        print(f"Requests Served: {request_count}, Uptime: {days} Days, {hours} Hours, {minutes} Minutes, {seconds} Seconds", end="\r", flush=True)
         """Accept base64 image via JSON POST and return space-separated tags."""
         if not request.is_json:
             return "Content-Type must be application/json", 400
@@ -320,8 +332,8 @@ def main() -> None:
         help="Prefix all .txt caption files with the specified text. If the prefix matches a tag, the tag will not be repeated.")
     parser.add_argument("--service", action="store_true",
         help="Run as HTTP service. Enables /image endpoint for POST requests. Cannot be used with paths or other batch options.")
-    parser.add_argument("--host", type=str, default="127.0.0.1",
-        help="Host to bind HTTP service to. (Default: 127.0.0.1)")
+    parser.add_argument("--host", type=str, default="0.0.0.0",
+        help="Host to bind HTTP service to. (Default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=22870,
         help="Port to bind HTTP service to. (Default: 22870)")
     parser.add_argument("paths", nargs="*",
