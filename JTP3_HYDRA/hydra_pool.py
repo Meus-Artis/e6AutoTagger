@@ -1,5 +1,4 @@
 import re
-from collections import defaultdict
 from math import sqrt
 from typing import Any, Iterable, Self, cast
 
@@ -15,101 +14,6 @@ from torch.nn.functional import pad, scaled_dot_product_attention
 from einops import rearrange
 
 from glu import SwiGLU
-
-class IndexedAdd(Module):
-    def __init__(
-        self,
-        n_indices: int,
-        dim: int,
-        weight_shape: tuple[int, ...] | None = None,
-        *,
-        inplace: bool = False,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        super().__init__()
-
-        self.dim = dim
-        self.inplace = inplace
-
-        self.index = Buffer(torch.empty(
-            2, n_indices,
-            device=device, dtype=torch.int32
-        ))
-
-        self.weight = Parameter(torch.ones(
-            *(sz if sz != -1 else n_indices for sz in weight_shape),
-            device=device, dtype=dtype
-        )) if weight_shape is not None else None
-
-    def _save_to_state_dict(
-        self,
-        destination: dict[str, Any],
-        prefix: str,
-        keep_vars: bool
-    ) -> None:
-        super()._save_to_state_dict(destination, prefix, keep_vars)
-
-        if keep_vars:
-            return
-
-        with torch.no_grad():
-            index_key = f"{prefix}index"
-            index = destination[index_key]
-
-            min_index = index.amin(None).item()
-            if min_index >= 0:
-                max_index = index.amax(None).item()
-                if max_index < (1 << 8):
-                    destination[index_key] = index.to(dtype=torch.uint8)
-                elif max_index < (1 << 16):
-                    destination[index_key] = index.to(dtype=torch.uint16)
-
-    @torch.no_grad()
-    def load_indices(self, indices: Iterable[tuple[int, int]], *, mean: bool = False) -> None:
-        if mean:
-            if self.weight is None:
-                raise ValueError("No weights to initialize with means.")
-
-            groups: dict[int, list[int]] = defaultdict(list)
-
-        idx = -1
-        for idx, (src, dst) in enumerate(indices):
-            self.index[0, idx] = src
-            self.index[1, idx] = dst
-
-            if mean:
-                groups[dst].append(idx)
-
-        if (idx + 1) != self.index.size(1):
-            raise IndexError(f"Expected {self.index.size(1)} indices, but got {idx + 1}.")
-
-        if not mean:
-            return
-
-        assert self.weight is not None
-
-        for idxs in groups.values():
-            if len(idxs) < 2:
-                continue
-
-            self.weight.index_fill_(
-                self.dim,
-                torch.tensor(idxs, device=self.weight.device, dtype=torch.int64),
-                1.0 / len(idxs)
-            )
-
-    def forward(self, dst: Tensor, src: Tensor) -> Tensor:
-        src = src.index_select(self.dim, self.index[0])
-
-        if self.weight is not None:
-            src.mul_(self.weight)
-
-        return (
-            dst.index_add_(self.dim, self.index[1], src)
-            if self.inplace else
-            dst.index_add(self.dim, self.index[1], src)
-        )
 
 class BatchLinear(Module):
     def __init__(
@@ -206,17 +110,12 @@ class _MidBlock(Module):
 
         self.q_norm = RMSNorm(head_dim, eps=1e-5, elementwise_affine=False)
 
-        self.attn_out = Linear(
-            attn_dim, attn_dim, bias=False,
-            device=device, dtype=dtype
-        )
-
         self.ff_norm = LayerNorm(
-            attn_dim,
+            attn_dim * 2, elementwise_affine=False,
             device=device, dtype=dtype
         )
         self.ff_in = Linear(
-            attn_dim, hidden_dim * 2, bias=False,
+            attn_dim * 2, hidden_dim * 2, bias=False,
             device=device, dtype=dtype
         )
         self.ff_act = SwiGLU()
@@ -235,30 +134,46 @@ class _MidBlock(Module):
             x = x + self.q_cls
 
         x = self.q_norm(x)
-        x = rearrange(x, "... s (h e) -> ... h s e", e=self.head_dim)
         return x
 
     def _forward_attn(self, x: Tensor, k: Tensor, v: Tensor, attn_mask: Tensor | None) -> Tensor:
-        a = scaled_dot_product_attention(
-            self._forward_q(x), k, v,
-            attn_mask=attn_mask
-        )
-        a = rearrange(a, "... h s e -> ... s (h e)")
-        a = self.attn_out(a)
-        return x + a
+        x = self._forward_q(x)
+        x = rearrange(x, "... s (h e) -> ... h s e", e=self.head_dim)
+
+        x = scaled_dot_product_attention(x, k, v, attn_mask=attn_mask)
+        x = rearrange(x, "... h s e -> ... s (h e)")
+        return x
 
     def _forward_ff(self, x: Tensor) -> Tensor:
-        f = self.ff_norm(x)
-        f = self.ff_in(f)
-        f = self.ff_act(f)
-        f = self.ff_drop(f)
-        f = self.ff_out(f)
-        return x + f
+        x = self.ff_norm(x)
+        x = self.ff_in(x)
+        x = self.ff_act(x)
+        x = self.ff_drop(x)
+        x = self.ff_out(x)
+        return x
 
     def forward(self, x: Tensor, k: Tensor, v: Tensor, attn_mask: Tensor | None = None) -> Tensor:
-        x = self._forward_attn(x, k, v, attn_mask)
-        x = self._forward_ff(x)
-        return x
+        a = self._forward_attn(x, k, v, attn_mask)
+        a = torch.cat((x, a), dim=-1)
+        a = self._forward_ff(a)
+        return x + a
+
+    def reset_classes(self, n_classes: int) -> None:
+        if n_classes < 1:
+            raise ValueError("Number of classes must be positive.")
+
+        self.q_cls = Parameter(torch.randn(
+            self.q_cls.size(0), n_classes, self.q_cls.size(2),
+            device=self.q_cls.device, dtype=self.q_cls.dtype
+        ))
+
+    def select_classes(self, classes: Tensor | list[int] | int) -> None:
+        if isinstance(classes, int):
+            classes = [classes]
+        elif len(classes) < 1:
+            raise ValueError("Must select at least one class.")
+
+        self.q_cls = Parameter(self.q_cls[:, classes, :])
 
 class HydraPool(Module):
     def __init__(
@@ -268,11 +183,11 @@ class HydraPool(Module):
         n_classes: int,
         *,
         mid_blocks: int = 0,
-        roots: tuple[int, int, int] = (0, 0, 0),
         ff_ratio: float = 3.0,
         ff_dropout: float = 0.0,
         input_dim: int = -1,
         output_dim: int = 1,
+        tie_kv: bool = False,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -287,54 +202,19 @@ class HydraPool(Module):
         self.n_classes = n_classes
         self.head_dim = head_dim
         self.output_dim = output_dim
+        self.tie_kv = tie_kv
 
-        self._has_roots = False
         self._has_ff = False
+        self._q_normed = False
 
-        self.q: Parameter | Buffer
-        self._q_normed: bool | None
+        self.q = Parameter(torch.randn(
+            n_heads, n_classes, head_dim,
+            device=device, dtype=dtype
+        ))
 
-        if roots != (0, 0, 0):
-            self._has_roots = True
-            n_roots, n_classroots, n_subclasses = roots
-
-            if n_classroots < n_roots:
-                raise ValueError("Number of classroots cannot be less than the number of roots.")
-
-            self.cls = Parameter(torch.randn(
-                n_heads, n_classes, head_dim,
-                device=device, dtype=dtype
-            ))
-
-            self.roots = Parameter(torch.randn(
-                n_heads, n_roots, head_dim,
-                device=device, dtype=dtype
-            )) if n_roots > 0 else None
-
-            self.clsroots = IndexedAdd(
-                n_classroots, dim=-2, weight_shape=(n_heads, -1, 1),
-                device=device, dtype=dtype
-            ) if n_classroots > 0 else None
-
-            self.clscls = IndexedAdd(
-                n_subclasses, dim=-2, weight_shape=(n_heads, -1, 1),
-                inplace=True, device=device, dtype=dtype
-            ) if n_subclasses > 0 else None
-
-            self.q = Buffer(torch.empty(
-                n_heads, n_classes, head_dim,
-                device=device, dtype=dtype
-            ))
-            self._q_normed = None
-        else:
-            self.q = Parameter(torch.randn(
-                n_heads, n_classes, head_dim,
-                device=device, dtype=dtype
-            ))
-            self._q_normed = False
-
+        kv_dim = attn_dim if self.tie_kv else attn_dim * 2
         self.kv = Linear(
-            input_dim, attn_dim * 2, bias=False,
+            input_dim, kv_dim, bias=False,
             device=device, dtype=dtype
         )
         self.qk_norm = RMSNorm(
@@ -376,10 +256,6 @@ class HydraPool(Module):
         )
         self.out_act = SwiGLU()
 
-    @property
-    def has_roots(self) -> bool:
-        return self._has_roots
-
     def get_extra_state(self) -> dict[str, Any]:
         return { "q_normed": self._q_normed }
 
@@ -392,66 +268,122 @@ class HydraPool(Module):
 
         return Mean(-1)
 
+    def reset_classes(self, n_classes: int) -> None:
+        if n_classes < 1:
+            raise ValueError("Number of classes must be positive.")
+
+        self.q = Parameter(torch.randn(
+            self.q.size(0), n_classes, self.q.size(2),
+            device=self.q.device, dtype=self.q.dtype
+        ))
+        self._q_normed = False
+
+        op = self.out_proj.weight
+        self.out_proj = BatchLinear(
+            n_classes, op.size(1), op.size(2),
+            device=op.device, dtype=op.dtype
+        )
+
+        for block in self.mid_blocks:
+            cast(_MidBlock, block).reset_classes(n_classes)
+
+        self.n_classes = n_classes
+
+    def select_classes(self, classes: Tensor | list[int] | int) -> None:
+        if isinstance(classes, int):
+            classes = [classes]
+        elif len(classes) < 1:
+            raise ValueError("Must select at least one class.")
+
+        self.q = Parameter(self.q[:, classes, :])
+        self.out_proj.weight = Parameter(self.out_proj.weight[classes, :, :])
+
+        for block in self.mid_blocks:
+            cast(_MidBlock, block).select_classes(classes)
+
+        self.n_classes = len(classes)
+
+    @torch.no_grad()
+    def load_extensions(
+        self,
+        extensions: Iterable[tuple[int | None, dict[str, Tensor]]]
+    ) -> None:
+        q_shape = (self.q.shape[0], 1, self.q.shape[2])
+        o_shape = (1, self.out_proj.weight.shape[1], self.out_proj.weight.shape[2])
+        mq_shape = (1, self.q.shape[0])
+
+        n = 0
+        q: list[Tensor] = [self.q]
+        o: list[Tensor] = [self.out_proj.weight]
+        mqs: list[list[Tensor]] = [
+            [cast(_MidBlock, block).q_cls]
+            for block in self.mid_blocks
+        ]
+
+        for idx, ext in extensions:
+            q_ext = ext["q"].to(device=self.q.device, non_blocking=True)
+            o_ext = ext["out_proj.weight"].to(device=self.out_proj.weight.device, non_blocking=True)
+
+            if q_ext.shape != q_shape:
+                raise ValueError(f"Extension has unexpected q shape {q_ext.shape}, expected {q_shape}.")
+
+            if o_ext.shape != o_shape:
+                raise ValueError(f"Extension has unexpected out_proj.weight shape {o_ext.shape}, expected {o_shape}.")
+
+            mqs_ext: list[Tensor] = []
+            for m_idx in range(len(self.mid_blocks)):
+                mq_ext = ext[f"mid_blocks.{m_idx}.q_cls"]
+                if mq_ext.shape != mq_shape:
+                    raise ValueError(f"Extension has unexpected mid_blocks.{m_idx}.q_cls shape {mq_ext.shape}, expected {mq_shape}.")
+
+                mqs_ext.append(mq_ext)
+
+            if f"mid_blocks.{len(self.mid_blocks)}.q_cls" in ext:
+                raise ValueError("Extension has too many mid_blocks.")
+
+            if idx is None:
+                n += 1
+                q.append(q_ext)
+                o.append(o_ext)
+
+                for mq, mq_ext in zip(mqs, mqs_ext):
+                    mq.append(mq_ext)
+            else:
+                self.q[:, idx, :].copy_(q_ext[:, 0, :])
+                self.out_proj.weight[idx, :, :].copy_(q_ext[0, :, :])
+
+                for block, mq_ext in zip(self.mid_blocks, mqs_ext):
+                    cast(_MidBlock, block).q_cls[idx, :].copy_(mq_ext[0, :])
+
+        if n:
+            self.n_classes += n
+            self.q = Parameter(torch.cat(q, dim=1))
+            self.out_proj.weight = Parameter(torch.cat(o, dim=0))
+
+            for block, mq in zip(self.mid_blocks, mqs):
+                cast(_MidBlock, block).q_cls = Parameter(torch.cat(mq, dim=0))
+
     def train(self, mode: bool = True) -> Self:
         super().train(mode)
 
         if mode:
-            if self._has_roots:
-                self._q_normed = None
-            else:
-                self._q_normed = False
-        else:
-            if self._has_roots:
-                self._cache_query()
+            self._q_normed = False
 
         return self
 
     def inference(self) -> Self:
         super().train(False)
-        self._cache_query()
 
-        if self._has_roots:
-            self._has_roots = False
-            self.q = Parameter(self.q)
+        if not self._q_normed:
+            with torch.no_grad():
+                self.q.copy_(self._forward_q())
 
-            del self.cls, self.roots, self.clsroots, self.clscls
+            self._q_normed = True
 
         return self
 
-    def _cache_query(self) -> None:
-        assert not self.training
-
-        if self._q_normed:
-            return
-
-        with torch.no_grad():
-            self.q.to(device=self.kv.weight.device)
-            self.q.copy_(self._forward_q())
-            self._q_normed = True
-
     def _forward_q(self) -> Tensor:
-        match self._q_normed:
-            case None:
-                assert self._has_roots
-
-                if self.roots is not None:
-                    q = self.qk_norm(self.roots)
-                    q = self.clsroots(self.cls, q)
-                else:
-                    q = self.cls
-
-                if self.clscls is not None:
-                    q = self.clscls(q, q.detach())
-
-                q = self.qk_norm(q)
-                return q
-
-            case False:
-                assert not self._has_roots
-                return self.qk_norm(self.q)
-
-            case True:
-                return self.q
+        return self.q if self._q_normed else self.qk_norm(self.q)
 
     def _forward_attn(self, x: Tensor, attn_mask: Tensor | None) -> tuple[Tensor, Tensor, Tensor]:
         q = self._forward_q().expand(*x.shape[:-2], -1, -1, -1)
@@ -489,47 +421,6 @@ class HydraPool(Module):
         x = self._forward_out(x)
         return x
 
-    def prune_roots(self, retain_classes: set[int]) -> tuple[list[int], list[int]]:
-        if not self._has_roots or self.roots is None:
-            raise TypeError("No roots to prune.")
-
-        if self.clscls is not None:
-            raise TypeError("Subclass roots cannot be pruned.")
-
-        used_roots: set[int] = set()
-        used_clsroots: list[int] = []
-
-        assert self.clsroots is not None
-        clsroots = [
-            cast(list[int], clsroot.tolist())
-            for clsroot in self.clsroots.index.cpu().unbind(1)
-        ]
-
-        for idx, (src, dest) in enumerate(clsroots):
-            if dest in retain_classes:
-                used_roots.add(src)
-                used_clsroots.append(idx)
-
-        sorted_roots = sorted(used_roots)
-        del used_roots
-
-        rootmap = {
-            root: idx
-            for idx, root in enumerate(sorted_roots)
-        }
-
-        clsmap = {
-            cls: idx
-            for idx, cls in enumerate(sorted(retain_classes))
-        }
-
-        for idx in used_clsroots:
-            src, dest = clsroots[idx]
-            self.clsroots.index[0, idx] = rootmap[src]
-            self.clsroots.index[1, idx] = clsmap[dest]
-
-        return sorted_roots, used_clsroots
-
     @staticmethod
     def for_state(
         state_dict: dict[str, Any],
@@ -542,15 +433,6 @@ class HydraPool(Module):
         n_heads, n_classes, head_dim = state_dict[f"{prefix}q"].shape
         attn_dim = n_heads * head_dim
 
-        roots_t = state_dict.get(f"{prefix}roots")
-        clsroots_t = state_dict.get(f"{prefix}clsroots.index")
-        clscls_t = state_dict.get(f"{prefix}clscls.index")
-        roots = (
-            roots_t.size(1) if roots_t is not None else 0,
-            clsroots_t.size(1) if clsroots_t is not None else 0,
-            clscls_t.size(1) if clscls_t is not None else 0
-        )
-
         input_dim = state_dict[f"{prefix}kv.weight"].size(1)
         output_dim = state_dict[f"{prefix}out_proj.weight"].size(2) // 2
 
@@ -558,6 +440,8 @@ class HydraPool(Module):
         ffout_t = state_dict.get(f"{prefix}ff_out.weight")
         hidden_dim = ffout_t.size(1) + 0.5 if ffout_t is not None else 0
         ff_ratio = hidden_dim / attn_dim
+
+        tie_kv = state_dict[f"{prefix}kv.weight"].size(0) == attn_dim
 
         pattern = re.compile(rf"^{re.escape(prefix)}mid_blocks\.([0-9]+)\.")
         mid_blocks = max([-1, *(
@@ -571,11 +455,11 @@ class HydraPool(Module):
             head_dim,
             n_classes,
             mid_blocks=mid_blocks,
-            roots=roots,
             ff_ratio=ff_ratio,
             ff_dropout=ff_dropout,
             input_dim=input_dim,
             output_dim=output_dim,
+            tie_kv=tie_kv,
             device=device,
             dtype=dtype
         )

@@ -1,17 +1,18 @@
+import os
+
 from math import ceil
+from typing import Iterable, cast
 
 import torch
 from torch import Tensor
 from torch.nn import Identity
-
-import timm
-from timm.models import NaFlexVit
 
 from PIL import Image
 
 from safetensors import safe_open
 
 from image import process_srgb, put_srgb_patch
+from siglip2 import NaFlexVit
 
 def sdpa_attn_mask(
     patch_valid: Tensor,
@@ -31,8 +32,6 @@ def sdpa_attn_mask(
         ), dim=-1)
 
     return mask
-
-timm.models.naflexvit.create_attention_mask = sdpa_attn_mask
 
 def get_image_size_for_seq(
     image_hw: tuple[int, int],
@@ -124,7 +123,12 @@ def load_image(
 
     return patchify_image(processed, patch_size, max_seq_len, share_memory)
 
-def load_model(path: str, device: torch.device | str | None = None) -> tuple[NaFlexVit, list[str]]:
+def load_model(
+    path: str,
+    *,
+    extensions: Iterable[str] = (),
+    device: torch.device | str | None = None
+) -> tuple[NaFlexVit, list[str], dict[str, dict[str, str]]]:
     with safe_open(path, framework="pt", device="cpu") as file:
         metadata = file.metadata()
 
@@ -137,56 +141,98 @@ def load_model(path: str, device: torch.device | str | None = None) -> tuple[NaF
     if not arch.startswith("naflexvit_so400m_patch16_siglip"):
         raise ValueError(f"Unrecognized model architecture: {arch}")
 
-    tags = metadata["classifier.labels"].split("\n")
+    labels = metadata["classifier.labels"].split("\n")
 
-    model = timm.create_model(
-        'naflexvit_so400m_patch16_siglip',
-        pretrained=False, num_classes=0,
-        pos_embed_interp_mode="bilinear",
-        weight_init="skip", fix_init=False,
-        device="cpu", dtype=torch.bfloat16,
-    )
+    model = NaFlexVit(len(labels), device="cpu", dtype=torch.bfloat16)
 
     match arch[31:]:
-        case "": # vanilla
-            model.reset_classifier(len(tags))
-
-        case "+rr_slim":
-            model.reset_classifier(len(tags))
-
-            if "attn_pool.q.weight" not in state_dict:
-                model.attn_pool.q = Identity()
-
-            if "head.bias" not in state_dict:
-                model.head.bias = None
-
-        case "+rr_chonker":
-            from chonker_pool import ChonkerPool
-
-            model.attn_pool = ChonkerPool(
-                2, 1152, 72,
-                device=device, dtype=torch.bfloat16
-            )
-            model.head = model.attn_pool.create_head(len(tags))
-            model.num_classes = len(tags)
-
         case "+rr_hydra":
             from hydra_pool import HydraPool
-
-            model.attn_pool = HydraPool.for_state(
+            attn_pool = HydraPool.for_state(
                 state_dict, "attn_pool.",
                 device=device, dtype=torch.bfloat16
             )
-            model.head = model.attn_pool.create_head()
-            model.num_classes = len(tags)
+
+            model.attn_pool = attn_pool          # type: ignore
+            model.head = attn_pool.create_head() # type: ignore
 
             state_dict["attn_pool._extra_state"] = { "q_normed": True }
 
         case _:
             raise ValueError(f"Unrecognized model architecture: {arch}")
 
-    model.eval().to(dtype=torch.bfloat16)
+    model.eval()
     model.load_state_dict(state_dict, strict=True)
-    model.to(device=device)
 
-    return model, tags
+    setattr(model, "architecture", arch)
+
+    ext_labels: dict[str, str] = {}
+    ext_data: list[tuple[int | None, dict[str, Tensor]]] = []
+    ext_info: dict[str, dict[str, str]] = {}
+
+    for ext_path in extensions:
+        ext_metadata, ext_weights = load_extension(ext_path)
+        ext_arch  = ext_metadata["architecture"]
+        ext_label = ext_metadata["label"]
+
+        if ext_metadata["architecture"] != arch:
+            raise RuntimeError(f"Extension {repr(ext_path)} has incompatible architecture {repr(ext_arch)}, expected {repr(arch)}.")
+
+        if (conflict_path := ext_labels.get(ext_label)) is not None:
+            raise RuntimeError(f"Extension {repr(ext_path)} conflicts with extension {repr(conflict_path)} over label {repr(ext_label)}.")
+
+        ext_labels[ext_label] = ext_path
+
+        ext_idx: int | None = None
+        try:
+            ext_idx = labels.index(ext_label)
+        except ValueError:
+            labels.append(ext_label)
+
+        ext_data.append((ext_idx, ext_weights))
+        ext_info[ext_path] = ext_metadata
+
+    if ext_data:
+        attn_pool.load_extensions(ext_data)
+        model.num_classes = attn_pool.n_classes
+
+    model.to(device=device)
+    return model, labels, ext_info
+
+def load_extension(path: str) -> tuple[dict[str, str], dict[str, Tensor]]:
+    with safe_open(path, framework="pt", device="cpu") as file:
+        metadata = file.metadata()
+
+        impl = metadata.get("modelspec.implementation")
+        match impl:
+            case None:
+                raise RuntimeError(f"File {repr(path)} is missing SAI modelspec metadata.")
+
+            case "redrocket.extension.label.v1":
+                info = {
+                    "architecture": metadata["modelspec.architecture"],
+                    "label": metadata["classifier.label"],
+                    "category": metadata.get("classifier.label.category", "general"),
+                    "implies": metadata.get("classifier.label.implies", ""),
+                }
+
+            case _:
+                raise RuntimeError(f"File {repr(path)} has unrecognized implementation {repr(impl)}.")
+
+        return info, { key: file.get_tensor(key) for key in file.keys() }
+
+def discover_extensions(paths: Iterable[str] | str) -> Iterable[str]:
+    if isinstance(paths, str):
+        paths = (paths,)
+
+    for path in paths:
+        if os.path.isdir(path):
+            for entry in os.scandir(path):
+                if (
+                    entry.is_file()
+                    and entry.name.endswith(".safetensors")
+                    and not entry.name.startswith(".")
+                ):
+                    yield entry.path
+        else:
+            yield path

@@ -1,4 +1,7 @@
-timm
+torch
+numpy
 pillow
 einops
+safetensors
+huggingface_hub
 flask
