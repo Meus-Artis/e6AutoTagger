@@ -5,6 +5,9 @@ Adds button for automatic tagging in "Other Tags" text box
 
 Attempts using local JTP before falling back to public server
 
+###### Notice:
+##### Setting in Tampermonkey for ``Security > Modify existing content security policy (CSP) headers`` Needs to be set to either "No" or "Remove Entirely" to function on firefox, Chrome requires "Remove Entirely".
+
 Simple automatic (Windows) installer included in [JTP_PILOT2](https://huggingface.co/RedRocket/JointTaggerProject) folder (deprecated) or [JTP3_HYDRA](https://huggingface.co/RedRocket/JTP-3) folder, requires python to be installed and in PATH
 
 # Demo Video:

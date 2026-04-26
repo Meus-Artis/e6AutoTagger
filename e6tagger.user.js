@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         e621 Autotagger
 // @namespace    https://MeusArtis.ca
-// @version      1.4.1
+// @version      1.5
 // @author       Meus Artis
 // @description  Adds a button that automatically tags e621 images and videos
 // @icon         https://www.google.com/s2/favicons?domain=e621.net
@@ -13,6 +13,8 @@
 // @license      CC BY-NC-SA 4.0
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @connect      127.0.0.1
+// @connect      meusartis.ca
 // ==/UserScript==
 (function() {
     function sendRequest(url, base64String, confidence, textarea, fallback, done) {
@@ -20,11 +22,11 @@
             method: "POST",
             url: url,
             headers: { "Content-Type": "application/json" },
-            data: JSON.stringify({ data: [base64String, confidence], fn_index: 0 }),
-            responseType: "text", //json
+            data: JSON.stringify({ data: [base64String, confidence] }),
+            responseType: "text",
             onload: function(response) {
                 if (response.status === 200 && response.response) {
-                    textarea.value = response.response; //.data[0];
+                    textarea.value = response.response;
                     done();
                 } else if (fallback) {
                     sendRequest(fallback, base64String, confidence, textarea, null, done);
@@ -155,5 +157,11 @@
         window.open("https://ko-fi.com/meusartis", '_blank');
     }
     GM_registerMenuCommand("Donate", donate);
-    window.addEventListener("load", addButton);
+    function load() {
+        window.removeEventListener("drop", load);
+        window.removeEventListener("click", load);
+        addButton();
+    }
+    window.addEventListener("drop", load);
+    window.addEventListener("click", load);
 })();
