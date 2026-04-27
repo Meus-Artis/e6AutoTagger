@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         e621 Autotagger
 // @namespace    https://MeusArtis.ca
-// @version      1.5
+// @version      1.5.1
 // @author       Meus Artis
 // @description  Adds a button that automatically tags e621 images and videos
 // @icon         https://www.google.com/s2/favicons?domain=e621.net
@@ -15,6 +15,7 @@
 // @grant        GM_registerMenuCommand
 // @connect      127.0.0.1
 // @connect      meusartis.ca
+// @inject-into  content
 // ==/UserScript==
 (function() {
     function sendRequest(url, base64String, confidence, textarea, fallback, done) {
