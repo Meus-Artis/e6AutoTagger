@@ -1,0 +1,9 @@
+numpy
+pyvips[binary]
+einops
+safetensors
+requests
+fastapi
+uvicorn
+PySide6 == 6.11.*
+torch < 2.14
