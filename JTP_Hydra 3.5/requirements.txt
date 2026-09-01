@@ -6,4 +6,5 @@ requests
 fastapi
 uvicorn
 PySide6 == 6.11.*
+huggingface_hub
 torch < 2.14
